@@ -38,12 +38,11 @@ SLACK_CHANNEL_ID_B = os.getenv("SLACK_CHANNEL_ID_B")
 HUBSPOT_PORTAL_BASE = os.getenv("HUBSPOT_PORTAL_BASE", "https://app.hubspot.com")
 HUBSPOT_PORTAL_ID = os.getenv("HUBSPOT_PORTAL_ID")  # e.g. "12345678" (REQUIRED for ticket link)
 
-CHURN_ALERT_THRESHOLD = 6.0
-
 # ---------------------- CONSTANTS ----------------------
 EMAIL_LIMIT = 20
 MAX_EMAIL_BODY_CHARS = 1200
 DEFAULT_HTTP_TIMEOUT = 15
+MAX_SPAM_SCAN_CHARS = 2500
 
 TS_FIELDS = [
     "hs_email_received_date",
@@ -59,6 +58,14 @@ BODY_FIELDS = [
 ]
 
 TAG_RE = re.compile(r"<[^>]+>")
+SPAM_SIGNAL_RE = re.compile(
+    r"(\bout\s*of\s*office\b|\bautomatic\s*reply\b|\bauto\s*reply\b|\booo\b|"
+    r"\bnewsletter\b|\bunsubscribe\b|\bmarketing\b|\bpromot(?:ion|ional)\b|"
+    r"\badvertis(?:e|ing|ement)\b|\bcold\s*outreach\b|\blead\s*generation\b|"
+    r"\bseo\s+services\b|\bppc\b|\bweb\s*design\s*services\b|"
+    r"\bwe\s+offer\s+services\b|\boffering\s+services\b|\bbook\s+a\s+demo\b)",
+    re.IGNORECASE,
+)
 
 TICKET_PROPS = [
     "hs_pipeline",
@@ -637,23 +644,36 @@ def summarize_previous_emails_with_claude(email_items):
     score = float(data.get("sentiment_score"))
     return summary, score
 
-def detect_spam_with_claude(summary_text: str):
+def is_obvious_spam_text(subject: str, body: str) -> bool:
+    text = f"{(subject or '').strip()}\n{(body or '').strip()}"
+    compact = truncate(text.lower(), MAX_SPAM_SCAN_CHARS)
+    return bool(SPAM_SIGNAL_RE.search(compact))
+
+
+def detect_spam_with_claude(subject_text: str, body_text: str, summary_text: str = ""):
     """
     Returns True if spam, False otherwise.
     """
     if not CLAUDE_MODEL_ID:
         raise RuntimeError("Missing CLAUDE_MODEL_ID env var")
 
+    subject_text = truncate(subject_text or "", 500)
+    body_text = truncate(body_text or "", MAX_SPAM_SCAN_CHARS)
+    summary_text = truncate(summary_text or "", 1200)
+
     prompt = (
-        "You are an AI that detects whether a message is spam or advertising.\n\n"
-        "Spam includes:\n"
-        "- Out of Office emails or Automatic Replies or Emails titled with OOO, Automatic Reply\n"
-        "- Promotions, newsletters ,marketing emails like Providing Services or Offering Services\n"
-        "- Irrelevant advertisements\n"
-        "- Generic outreach not related to a support issue\n\n"
+        "You are a strict classifier that detects whether a customer message is spam.\n\n"
+        "Mark is_spam=true when the message is any of these:\n"
+        "- Out-of-office / automatic replies\n"
+        "- Marketing, newsletter, promotional, or advertisement emails\n"
+        "- Service-offering cold outreach (SEO, lead generation, web design, etc.)\n"
+        "- Generic sales outreach not tied to a real support issue\n\n"
+        "Mark is_spam=false only when there is a genuine support issue/question.\n\n"
         "Return STRICT JSON ONLY:\n"
-        "{\"is_spam\": true/false}\n\n"
-        f"Summary:\n{summary_text}"
+        "{\"is_spam\": true/false, \"reason\":\"<short reason>\"}\n\n"
+        f"Subject:\n{subject_text}\n\n"
+        f"Body:\n{body_text}\n\n"
+        f"Summary:\n{summary_text}\n"
     )
 
     resp = bedrock.converse(
@@ -835,8 +855,13 @@ def lambda_handler(event, context):
                             # -------- AI CALL 1: Latest email --------
                             summary, score = summarize_emails_with_claude(email_items[:1])
 
-                            # -------- AI CALL 2: Spam detection --------
-                            is_spam = detect_spam_with_claude(summary)
+                            latest_subject = email_items[0].get("subject") or ""
+                            latest_body = email_items[0].get("body") or ""
+
+                            # -------- Spam detection: heuristic + AI --------
+                            is_spam = is_obvious_spam_text(latest_subject, latest_body)
+                            if not is_spam:
+                                is_spam = detect_spam_with_claude(latest_subject, latest_body, summary)
 
                             if is_spam:
                                 log(
@@ -844,6 +869,7 @@ def lambda_handler(event, context):
                                     "Spam detected — skipping Slack + previous summarization",
                                     msg_id=msg_id,
                                     ticket_id=ticket_id,
+                                    route=route["name"],
                                 )
                                 continue  # 🚨 HARD STOP
 
@@ -861,7 +887,27 @@ def lambda_handler(event, context):
                 # -------- Path B: No Company -> summarize ticket content --------
                 else:
                     log("INFO", "No company resolved; summarizing ticket only", msg_id=msg_id, ticket_id=ticket_id, contact_id=contact_id)
+                    if is_obvious_spam_text(ticket_subject, ticket_content):
+                        log(
+                            "INFO",
+                            "Spam detected in ticket-only path (heuristic) — skipping Slack",
+                            msg_id=msg_id,
+                            ticket_id=ticket_id,
+                            route=route["name"],
+                        )
+                        continue
+
                     summary, score = summarize_ticket_with_claude(ticket_subject, ticket_content)
+                    if detect_spam_with_claude(ticket_subject, ticket_content, summary):
+                        log(
+                            "INFO",
+                            "Spam detected in ticket-only path (AI) — skipping Slack",
+                            msg_id=msg_id,
+                            ticket_id=ticket_id,
+                            route=route["name"],
+                        )
+                        continue
+
                     summary_prev, score_prev = summary, score
                     goto_slack_company = None
                     goto_company_id = None
@@ -871,21 +917,7 @@ def lambda_handler(event, context):
                 score_txt = f"{score:.1f}"
                 emoji = "🟢" if score >= 7 else "🟡" if score >= 5 else "🔴"
                 score_prev_txt = f"{score_prev:.1f}"
-                emoji_prev = "��" if score_prev >= 7 else "🟡" if score_prev >= 5 else "🔴"
-
-                # ✅ ONLY POST IF either score <= 6
-                if score > 6 and score_prev > 6:
-                    log(
-                        "INFO",
-                        "Skipping Slack post — sentiment above threshold",
-                        msg_id=msg_id,
-                        ticket_id=ticket_id,
-                        latest_score=score,
-                        previous_score=score_prev,
-                        threshold=6,
-                        route=route["name"],
-                    )
-                    continue
+                emoji_prev = "🟢" if score_prev >= 7 else "🟡" if score_prev >= 5 else "🔴"
 
                 ticket_title = ticket_subject or f"Ticket {ticket_id}"
 
@@ -917,7 +949,7 @@ def lambda_handler(event, context):
 
                 log(
                     "INFO",
-                    "Posted to Slack (churn threshold met)",
+                    "Posted to Slack",
                     msg_id=msg_id,
                     ticket_id=ticket_id,
                     latest_score=score,
