@@ -38,12 +38,11 @@ SLACK_CHANNEL_ID_B = os.getenv("SLACK_CHANNEL_ID_B")
 HUBSPOT_PORTAL_BASE = os.getenv("HUBSPOT_PORTAL_BASE", "https://app.hubspot.com")
 HUBSPOT_PORTAL_ID = os.getenv("HUBSPOT_PORTAL_ID")  # e.g. "12345678" (REQUIRED for ticket link)
 
-CHURN_ALERT_THRESHOLD = 6.0
-
 # ---------------------- CONSTANTS ----------------------
 EMAIL_LIMIT = 20
 MAX_EMAIL_BODY_CHARS = 1200
 DEFAULT_HTTP_TIMEOUT = 15
+MAX_SPAM_SCAN_CHARS = 2500
 
 TS_FIELDS = [
     "hs_email_received_date",
@@ -59,6 +58,24 @@ BODY_FIELDS = [
 ]
 
 TAG_RE = re.compile(r"<[^>]+>")
+SPAM_SIGNAL_RE = re.compile(
+    r"(\bout\s*of\s*office\b|\bautomatic\s*reply\b|\bauto\s*reply\b|\booo\b|"
+    r"\bnewsletter\b|\bunsubscribe\b|\bmarketing\b|\bpromot(?:ion|ional)\b|"
+    r"\badvertis(?:e|ing|ement)\b|\bcold\s*outreach\b|\blead\s*generation\b|"
+    r"\bseo\s+services\b|\bppc\b|\bweb\s*design\s*services\b|"
+    r"\bwe\s+offer\s+services\b|\boffering\s+services\b|\bbook\s+a\s+demo\b)",
+    re.IGNORECASE,
+)
+AUTO_REPLY_SUBJECT_RE = re.compile(
+    r"(^|\W)(automatic\s*reply|auto\s*reply|out\s*of\s*office|ooo|away\s*from\s*the\s*office|on\s*leave)(\W|$)",
+    re.IGNORECASE,
+)
+AUTO_REPLY_BODY_RE = re.compile(
+    r"(this\s+is\s+an\s+automatic\s+reply|i\s+(?:am|\'m)\s+currently\s+out\s+of\s+office|"
+    r"i\s+will\s+be\s+out\s+of\s+office|i\s+am\s+away\s+from\s+the\s+office|"
+    r"thank\s+you\s+for\s+your\s+email\.\s*i\s+am\s+currently\s+out)",
+    re.IGNORECASE,
+)
 
 TICKET_PROPS = [
     "hs_pipeline",
@@ -66,6 +83,8 @@ TICKET_PROPS = [
     "subject",
     "content",
     "createdate",
+    "hubspot_owner_id",
+    "hs_ticket_owner",
 ]
 
 CONTACT_PROPS = [
@@ -87,6 +106,8 @@ bedrock = session.client(
 
 # ---------------------- CACHES (warm container) ----------------------
 COMPANY_NAME_CACHE = {}
+COMPANY_OWNER_CACHE = {}  # company_id -> owner_id or None
+OWNER_NAME_CACHE = {}  # owner_id -> owner_name or None
 CONTACT_CACHE = {}  # contact_id -> dict(props) or None
 CONTACT_COMPANY_CACHE = {}  # contact_id -> company_id or None
 
@@ -387,21 +408,74 @@ def resolve_company_or_fallback_identity(ticket_id: str):
     return None, None, None
 
 
-def get_company_name(company_id: str):
-    if company_id in COMPANY_NAME_CACHE:
-        return COMPANY_NAME_CACHE[company_id]
-
-    url = f"{HUBSPOT_BASE}/crm/v3/objects/companies/{company_id}?properties=name"
+def _read_company_properties(company_id: str):
+    url = f"{HUBSPOT_BASE}/crm/v3/objects/companies/{company_id}?properties=name,hubspot_owner_id"
     code, body = _http("GET", url, headers=hubspot_auth_headers(), timeout=DEFAULT_HTTP_TIMEOUT)
     if code != 200:
         COMPANY_NAME_CACHE[company_id] = None
+        COMPANY_OWNER_CACHE[company_id] = None
+        return None
+    data = json.loads(body)
+    props = data.get("properties") or {}
+    name = (props.get("name") or "").strip() or None
+    owner_id = str(props.get("hubspot_owner_id") or "").strip() or None
+    COMPANY_NAME_CACHE[company_id] = name
+    COMPANY_OWNER_CACHE[company_id] = owner_id
+    return props
+
+
+def get_company_name(company_id: str):
+    if company_id in COMPANY_NAME_CACHE:
+        return COMPANY_NAME_CACHE[company_id]
+    _read_company_properties(company_id)
+    return COMPANY_NAME_CACHE.get(company_id)
+
+
+def get_company_owner_id(company_id: str):
+    if company_id in COMPANY_OWNER_CACHE:
+        return COMPANY_OWNER_CACHE[company_id]
+    _read_company_properties(company_id)
+    return COMPANY_OWNER_CACHE.get(company_id)
+
+
+def get_owner_name(owner_id: str):
+    oid = str(owner_id or "").strip()
+    if not oid:
+        return None
+    if oid in OWNER_NAME_CACHE:
+        return OWNER_NAME_CACHE[oid]
+
+    url = f"{HUBSPOT_BASE}/crm/v3/owners/{urllib.parse.quote(oid)}"
+    code, body = _http("GET", url, headers=hubspot_auth_headers(), timeout=DEFAULT_HTTP_TIMEOUT)
+    if code != 200:
+        OWNER_NAME_CACHE[oid] = None
         return None
 
     data = json.loads(body)
-    name = (data.get("properties") or {}).get("name") or ""
-    clean = name.strip() or None
-    COMPANY_NAME_CACHE[company_id] = clean
-    return clean
+    first = (data.get("firstName") or "").strip()
+    last = (data.get("lastName") or "").strip()
+    email = (data.get("email") or "").strip()
+    full_name = " ".join([x for x in (first, last) if x]).strip()
+    owner_name = full_name or email or oid
+    OWNER_NAME_CACHE[oid] = owner_name
+    return owner_name
+
+
+def resolve_ticket_owner_name(ticket_props: dict, company_id: str = None):
+    ticket_owner_id = str(
+        ticket_props.get("hubspot_owner_id")
+        or ticket_props.get("hs_ticket_owner")
+        or ""
+    ).strip()
+    if ticket_owner_id:
+        return get_owner_name(ticket_owner_id) or f"Owner ID {ticket_owner_id}"
+
+    if company_id:
+        company_owner_id = get_company_owner_id(company_id)
+        if company_owner_id:
+            return get_owner_name(company_owner_id) or f"Owner ID {company_owner_id}"
+
+    return "(unassigned)"
 
 
 # ---------------------- HUBSPOT: Emails ----------------------
@@ -637,23 +711,43 @@ def summarize_previous_emails_with_claude(email_items):
     score = float(data.get("sentiment_score"))
     return summary, score
 
-def detect_spam_with_claude(summary_text: str):
+def is_obvious_spam_text(subject: str, body: str) -> bool:
+    subject_clean = (subject or "").strip().lower()
+    body_clean = (body or "").strip().lower()
+    text = f"{subject_clean}\n{body_clean}"
+    compact = truncate(text, MAX_SPAM_SCAN_CHARS)
+
+    if AUTO_REPLY_SUBJECT_RE.search(subject_clean):
+        return True
+    if AUTO_REPLY_BODY_RE.search(compact):
+        return True
+    return bool(SPAM_SIGNAL_RE.search(compact))
+
+
+def detect_spam_with_claude(subject_text: str, body_text: str, summary_text: str = ""):
     """
     Returns True if spam, False otherwise.
     """
     if not CLAUDE_MODEL_ID:
         raise RuntimeError("Missing CLAUDE_MODEL_ID env var")
 
+    subject_text = truncate(subject_text or "", 500)
+    body_text = truncate(body_text or "", MAX_SPAM_SCAN_CHARS)
+    summary_text = truncate(summary_text or "", 1200)
+
     prompt = (
-        "You are an AI that detects whether a message is spam or advertising.\n\n"
-        "Spam includes:\n"
-        "- Out of Office emails or Automatic Replies or Emails titled with OOO, Automatic Reply\n"
-        "- Promotions, newsletters ,marketing emails like Providing Services or Offering Services\n"
-        "- Irrelevant advertisements\n"
-        "- Generic outreach not related to a support issue\n\n"
+        "You are a strict classifier that detects whether a customer message is spam.\n\n"
+        "Mark is_spam=true when the message is any of these:\n"
+        "- Out-of-office / automatic replies (always spam for this workflow)\n"
+        "- Marketing, newsletter, promotional, or advertisement emails\n"
+        "- Service-offering cold outreach (SEO, lead generation, web design, etc.)\n"
+        "- Generic sales outreach not tied to a real support issue\n\n"
+        "Mark is_spam=false only when there is a genuine support issue/question.\n\n"
         "Return STRICT JSON ONLY:\n"
-        "{\"is_spam\": true/false}\n\n"
-        f"Summary:\n{summary_text}"
+        "{\"is_spam\": true/false, \"reason\":\"<short reason>\"}\n\n"
+        f"Subject:\n{subject_text}\n\n"
+        f"Body:\n{body_text}\n\n"
+        f"Summary:\n{summary_text}\n"
     )
 
     resp = bedrock.converse(
@@ -794,6 +888,7 @@ def lambda_handler(event, context):
 
                 # Resolve company if possible, else contact identity
                 company_id, contact_identity, contact_id = resolve_company_or_fallback_identity(ticket_id)
+                owner_name = resolve_ticket_owner_name(tprops, company_id=company_id)
 
                 # -------- Path A: Company found -> summarize latest email + previous 19 emails --------
                 if company_id:
@@ -832,11 +927,13 @@ def lambda_handler(event, context):
                             goto_identity = contact_identity or "(unknown contact)"
                             goto_mode = "ticket_fallback_no_email_bodies"
                         else:
-                            # -------- AI CALL 1: Latest email --------
-                            summary, score = summarize_emails_with_claude(email_items[:1])
+                            latest_subject = email_items[0].get("subject") or ""
+                            latest_body = email_items[0].get("body") or ""
 
-                            # -------- AI CALL 2: Spam detection --------
-                            is_spam = detect_spam_with_claude(summary)
+                            # -------- Spam detection: heuristic + AI --------
+                            is_spam = is_obvious_spam_text(latest_subject, latest_body)
+                            if not is_spam:
+                                is_spam = detect_spam_with_claude(latest_subject, latest_body)
 
                             if is_spam:
                                 log(
@@ -844,8 +941,12 @@ def lambda_handler(event, context):
                                     "Spam detected — skipping Slack + previous summarization",
                                     msg_id=msg_id,
                                     ticket_id=ticket_id,
+                                    route=route["name"],
                                 )
                                 continue  # 🚨 HARD STOP
+
+                            # -------- AI CALL 1: Latest email --------
+                            summary, score = summarize_emails_with_claude(email_items[:1])
 
                             # -------- AI CALL 3: Previous emails --------
                             if len(email_items) > 1:
@@ -861,7 +962,27 @@ def lambda_handler(event, context):
                 # -------- Path B: No Company -> summarize ticket content --------
                 else:
                     log("INFO", "No company resolved; summarizing ticket only", msg_id=msg_id, ticket_id=ticket_id, contact_id=contact_id)
+                    if is_obvious_spam_text(ticket_subject, ticket_content):
+                        log(
+                            "INFO",
+                            "Spam detected in ticket-only path (heuristic) — skipping Slack",
+                            msg_id=msg_id,
+                            ticket_id=ticket_id,
+                            route=route["name"],
+                        )
+                        continue
+
                     summary, score = summarize_ticket_with_claude(ticket_subject, ticket_content)
+                    if detect_spam_with_claude(ticket_subject, ticket_content, summary):
+                        log(
+                            "INFO",
+                            "Spam detected in ticket-only path (AI) — skipping Slack",
+                            msg_id=msg_id,
+                            ticket_id=ticket_id,
+                            route=route["name"],
+                        )
+                        continue
+
                     summary_prev, score_prev = summary, score
                     goto_slack_company = None
                     goto_company_id = None
@@ -871,21 +992,7 @@ def lambda_handler(event, context):
                 score_txt = f"{score:.1f}"
                 emoji = "🟢" if score >= 7 else "🟡" if score >= 5 else "🔴"
                 score_prev_txt = f"{score_prev:.1f}"
-                emoji_prev = "��" if score_prev >= 7 else "🟡" if score_prev >= 5 else "🔴"
-
-                # ✅ ONLY POST IF either score <= 6
-                if score > 6 and score_prev > 6:
-                    log(
-                        "INFO",
-                        "Skipping Slack post — sentiment above threshold",
-                        msg_id=msg_id,
-                        ticket_id=ticket_id,
-                        latest_score=score,
-                        previous_score=score_prev,
-                        threshold=6,
-                        route=route["name"],
-                    )
-                    continue
+                emoji_prev = "🟢" if score_prev >= 7 else "🟡" if score_prev >= 5 else "🔴"
 
                 ticket_title = ticket_subject or f"Ticket {ticket_id}"
 
@@ -896,6 +1003,7 @@ def lambda_handler(event, context):
                             f"*Support Ticket Churn Summary* {emoji}",
                             f"*Mode:* {goto_mode}",
                             f"*Ticket:* {ticket_title} (`{ticket_id}`) — {ticket_link}",
+                            f"*Owner:* {owner_name}",
                         ]
 
                 if ticket_created:
@@ -917,7 +1025,7 @@ def lambda_handler(event, context):
 
                 log(
                     "INFO",
-                    "Posted to Slack (churn threshold met)",
+                    "Posted to Slack",
                     msg_id=msg_id,
                     ticket_id=ticket_id,
                     latest_score=score,
